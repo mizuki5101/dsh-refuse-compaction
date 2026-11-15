@@ -1,0 +1,14 @@
+# dsh-refuse-compaction bundle patch：无需部署侧配置即可挂载（默认值都在 Config
+# schema 里，默认档位 off = 完全无效果）。按需在 profile 层
+# （~/.dsh/profiles/desktop/cordis.patch.yml）覆盖 config：
+#
+#   - id: refuse-compaction
+#     name: dsh-refuse-compaction
+#     config:
+#       tier: off              # off（默认，无任何效果）| temporary（拦接下来 3 回合）| manual（每次先问）| forbid（驳回全部自动压缩）
+#       spareOverflow: false   # true = 「禁止」档也放行溢出恢复（provider 已确认超限时的兜底）
+#       promptBar: true        # 对话内提示条：拦截时在对话流显示拦截信息与按钮
+
+- insert:
+    - id: refuse-compaction
+      name: dsh-refuse-compaction

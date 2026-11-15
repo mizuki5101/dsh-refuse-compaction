@@ -1,0 +1,25 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: [20, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      # @deepseek-ai/schemastery 是 optional peer，但 lib/index.js 顶层 import 了它，
+      # 测试的挂载路径需要能解析到才有意义（与真实宿主环境一致）
+      - name: Install optional peer @deepseek-ai/schemastery
+        run: npm install --no-save @deepseek-ai/schemastery@^3.18.2
+      - name: Run tests
+        run: npm test

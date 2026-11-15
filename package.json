@@ -1,0 +1,67 @@
+{
+  "name": "dsh-refuse-compaction",
+  "description": "Refuse-compaction for dsh: intercepts the harness's AUTO-triggered context compaction (step pressure + model-switch pressure; overflow recovery is policy-gated) while manual /compact stays structurally untouched — the preset-scoped engine is resolved via agentPresets.serviceFor and wrapped in place. Four tiers: temporary (block the next 3 turns; auto-switches to manual-ask at >=90% occupancy), manual (block-first ask via an in-conversation bar: compact now / refuse / quiet for 3 turns / stop asking; a busy or failed compact-now is never silently dropped — it approves the next compaction checkpoint, which then runs at the engine's own step boundary), forbid (block all auto compaction), off. v0.2.0 adds an in-conversation occupancy gauge (ring progress + percent/tokens + tier quick-switch, revealed within a configurable fraction of the compaction point); v0.2.1 reads the dsh-compaction-policy row's live config straight from the loader entry tree (zero changes to that plugin) so the gauge follows its effective strategy. Optional linkage with dsh-exa-distill: while distilled digests are pending, pressure compaction is held until the condensed surface lands (95% safety valve).",
+  "version": "0.2.10",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "license": "MIT",
+  "author": "mizuki5101",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mizuki5101/dsh-refuse-compaction.git"
+  },
+  "bugs": {
+    "url": "https://github.com/mizuki5101/dsh-refuse-compaction/issues"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "plugin",
+    "compaction",
+    "context",
+    "intercept"
+  ],
+  "files": [
+    "lib",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings"
+      ]
+    },
+    "verifiedWith": "0.2.2-rc.3"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh-client-ui-settings": ">=0.2.0-rc.2 || >=0.2.1-0 || >=0.2.2-0",
+    "@deepseek-ai/schemastery": "^3.18.2",
+    "react": ">=18.2.0 <20.0.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-client-ui-settings": {
+      "optional": true
+    },
+    "@deepseek-ai/schemastery": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
+  },
+  "scripts": {
+    "test": "node --test test/smoke.mjs test/client-smoke.mjs"
+  }
+}

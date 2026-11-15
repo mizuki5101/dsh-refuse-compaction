@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>dsh-refuse-compaction 特效演示</title>
+<style>
+  body { font-family: system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; margin: 0; padding: 32px 24px 48px; background: #14161a; color: #e8e8ea; }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  .sub { font-size: 13px; opacity: 0.65; margin-bottom: 28px; line-height: 1.7; }
+  h2 { font-size: 14px; opacity: 0.85; margin: 30px 0 10px; border-left: 3px solid rgba(110,150,235,0.6); padding-left: 8px; }
+  .stage { max-width: 720px; }
+  .hint { font-size: 12px; opacity: 0.55; margin: 4px 0 10px; }
+  .refuse-compaction-prompt-bar, .refuse-compaction-gauge { animation: refuseBarIn 0.3s ease-out; }@keyframes refuseBarIn { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }.refuse-compaction-prompt-bar.ask { animation: refuseBarIn 0.3s ease-out, refuseAskPulse 1.8s ease-in-out 0.3s infinite; }@keyframes refuseAskPulse {  0%, 100% { border-color: rgba(255,140,90,0.45); box-shadow: none; }  50% { border-color: rgba(255,140,90,0.95); box-shadow: 0 0 0 3px rgba(255,140,90,0.14); }}.refuse-compaction-gauge circle.fg { transition: stroke-dashoffset 0.6s ease, stroke 0.6s ease; }.refuse-compaction-gauge.near { animation: refuseBarIn 0.3s ease-out, refuseNearPulse 1.8s ease-in-out 0.3s infinite; }@keyframes refuseNearPulse {  0%, 100% { border-color: rgba(110,150,235,0.4); box-shadow: none; }  50% { border-color: rgba(255,150,80,0.9); box-shadow: 0 0 0 3px rgba(255,150,80,0.13); }}.refuse-compaction-gauge button { transition: background 0.25s ease, color 0.25s ease, border-color 0.25s ease; }
+</style>
+</head>
+<body>
+<div class="stage">
+  <h1>dsh-refuse-compaction 特效演示</h1>
+  <div class="sub">以下每一行都是 <code>lib/client.js</code> 真实组件的渲染产物（同构 DOM + 同一份动画 CSS）。动画是真实动效——呼吸脉冲与入场滑入现在就在播放；档位按钮可点，高亮迁移带过渡。</div>
+
+  <h2>占用仪表 · 蓝色常态（压缩点进度 82%）</h2>
+  <div class="hint">revealAhead 默认 0.2：占用过阈值（窗口 60%）亮出；文本与环形同为"已用 / 压缩点"口径，总窗口占比交给 dsh 自带显示。</div>
+  <div class="refuse-compaction-gauge" style="margin:2px 0;padding:6px 12px;font-size:12px;line-height:1.6;display:flex;align-items:center;flex-wrap:wrap;gap:10px;border-radius:6px;border:1px solid rgba(110,150,235,0.4);background:rgba(110,150,235,0.07)"><svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true" style="flex-shrink:0"><circle cx="14" cy="14" r="11" fill="none" stroke="rgba(128,128,128,0.25)" stroke-width="3" /><circle class="fg" cx="14" cy="14" r="11" fill="none" stroke="rgba(110,150,235,0.9)" stroke-width="3" stroke-linecap="round" stroke-dasharray="69.11503837897544" stroke-dashoffset="12.440903769083356" transform="rotate(-90 14 14)" /></svg><div style="display:flex;flex-direction:column;gap:2px;min-width:0px"><div >82%（161k / 197k 压缩点）</div><div style="opacity:0.7">距压缩点 35k tokens</div></div><div style="display:flex;gap:6px;align-items:center;margin-left:auto"><span style="opacity:0.7">档位</span><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:rgba(110,150,235,0.22);color:inherit;font-weight:600;border-color:rgba(110,150,235,0.65)">关闭</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">临时</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">手动</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">禁止</button></div></div>
+
+  <h2>占用仪表 · 近压缩（压缩点进度 96%，橙色 + 呼吸脉冲）</h2>
+  <div class="hint">progress ≥ 85% 后描边转橙、边框脉冲。档位快切可点（乐观更新：按钮即时翻高亮）。</div>
+  <div class="refuse-compaction-gauge near" style="margin:2px 0;padding:6px 12px;font-size:12px;line-height:1.6;display:flex;align-items:center;flex-wrap:wrap;gap:10px;border-radius:6px;border:1px solid rgba(110,150,235,0.4);background:rgba(110,150,235,0.07)"><svg width="28" height="28" viewBox="0 0 28 28" aria-hidden="true" style="flex-shrink:0"><circle cx="14" cy="14" r="11" fill="none" stroke="rgba(128,128,128,0.25)" stroke-width="3" /><circle class="fg" cx="14" cy="14" r="11" fill="none" stroke="rgba(255,150,80,0.9)" stroke-width="3" stroke-linecap="round" stroke-dasharray="69.11503837897544" stroke-dashoffset="2.7799566828457527" transform="rotate(-90 14 14)" /></svg><div style="display:flex;flex-direction:column;gap:2px;min-width:0px"><div >96%（189k / 197k 压缩点）</div><div style="opacity:0.7">距压缩点 7.9k tokens</div></div><div style="display:flex;gap:6px;align-items:center;margin-left:auto"><span style="opacity:0.7">档位</span><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">关闭</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">临时</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:rgba(110,150,235,0.22);color:inherit;font-weight:600;border-color:rgba(110,150,235,0.65)">手动</button><button type="button" style="padding:2px 10px;font-size:12px;cursor:pointer;border-radius:999px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit;font-weight:600">禁止</button></div></div>
+
+  <h2>提示条 · 手动拒绝询问（ask，呼吸脉冲 + 四按钮 + 拦截计数）</h2>
+  <div class="refuse-compaction-prompt-bar ask" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(255,140,90,0.45);border-left:3px solid rgba(255,140,90,0.75);background:rgba(255,140,90,0.07);display:flex;flex-direction:column;gap:6px"><div >已拦截自动压缩——要放行本回合的自动压缩吗？ · 手动拒绝 · 占用 62%</div><div style="font-size:12px;opacity:0.7;line-height:1.5">本回合已拦 4 次自动压缩</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">立即压缩</button><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">拒绝压缩</button><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">三回合内不再询问</button><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">不再询问</button></div></div>
+
+  <h2>提示条 · 忙碌批准回落（queued，calm 灰态，无按钮）</h2>
+  <div class="hint">v0.2.7：回合中点「立即压缩」不再静默丢弃——批准落到下一个压缩检查点，在引擎自己的 step 边界自动执行。</div>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(128,128,128,0.3);border-left:3px solid rgba(128,128,128,0.4);background:rgba(128,128,128,0.06);display:flex;flex-direction:column;gap:6px"><div >已批准：下一个压缩检查点自动执行压缩 · 占用 62%</div><div style="font-size:12px;opacity:0.7;line-height:1.5">本回合已拦 4 次自动压缩</div></div>
+
+  <h2>提示条 · 临时拒绝拦截（blocked，还剩2回合）</h2>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(255,140,90,0.45);border-left:3px solid rgba(255,140,90,0.75);background:rgba(255,140,90,0.07);display:flex;flex-direction:column;gap:6px"><div >已拦截自动压缩 · 临时拒绝（还剩2回合） · 占用 66%</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">立即压缩</button></div></div>
+
+  <h2>提示条 · 禁止档拦截（blocked，仅「立即压缩」）</h2>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(255,140,90,0.45);border-left:3px solid rgba(255,140,90,0.75);background:rgba(255,140,90,0.07);display:flex;flex-direction:column;gap:6px"><div >已拦截自动压缩 · 禁止 · 占用 71%</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">立即压缩</button></div></div>
+
+  <h2>提示条 · 联动保持（blocked，精简落盘前）</h2>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(255,140,90,0.45);border-left:3px solid rgba(255,140,90,0.75);background:rgba(255,140,90,0.07);display:flex;flex-direction:column;gap:6px"><div >已拦截自动压缩 · 等待精简结果落盘（联动保持） · 占用 58%</div><div style="display:flex;gap:8px;flex-wrap:wrap"><button type="button" style="padding:3px 12px;font-size:12px;cursor:pointer;border-radius:6px;border:1px solid rgba(128,128,128,0.4);background:transparent;color:inherit">立即压缩</button></div></div>
+
+  <h2>提示条 · 已放行 / 已手动压缩（calm 灰态）</h2>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(128,128,128,0.3);border-left:3px solid rgba(128,128,128,0.4);background:rgba(128,128,128,0.06);display:flex;flex-direction:column;gap:6px"><div >本回合已放行（下一回合恢复拦截） · 占用 50%</div></div>
+  <div class="refuse-compaction-prompt-bar" style="margin:2px 0;padding:8px 12px;font-size:12px;line-height:1.6;border-radius:6px;border:1px solid rgba(128,128,128,0.3);border-left:3px solid rgba(128,128,128,0.4);background:rgba(128,128,128,0.06);display:flex;flex-direction:column;gap:6px"><div >已手动压缩上下文 · 占用 44%</div></div>
+</div>
+<script>
+  // 档位按钮演示：点击 → 高亮迁移（CSS transition 可见）
+  document.querySelectorAll('.refuse-compaction-gauge').forEach(function (gauge) {
+    var buttons = gauge.querySelectorAll('button')
+    if (buttons.length !== 4) return
+    buttons.forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        buttons.forEach(function (other) {
+          other.style.background = 'transparent'
+          other.style.borderColor = 'rgba(128,128,128,0.4)'
+        })
+        btn.style.background = 'rgba(110,150,235,0.22)'
+        btn.style.borderColor = 'rgba(110,150,235,0.65)'
+      })
+    })
+  })
+</script>
+</body>
+</html>
