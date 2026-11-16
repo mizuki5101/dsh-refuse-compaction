@@ -252,7 +252,7 @@ test('off 档：三个触发点全放行（engine 到达原始方法，结果透
 })
 
 test('forbid 档：压力/模型切换/溢出全拦（spareOverflow=false），compactNow 直通', async () => {
-  const h = mockHarness({ tier: 'forbid', engine: makeEngine({ result: { shadowedSeqs: [9] } }) })
+  const h = mockHarness({ tier: 'forbid', tokens: 90000, engine: makeEngine({ result: { shadowedSeqs: [9] } }) })
   const before = h.engine.compactNow
   assert.equal(await attemptPressure(h), null, '拦截 = 返回 null')
   assert.equal(await attemptSwitch(h), null)
@@ -267,15 +267,17 @@ test('forbid 档：压力/模型切换/溢出全拦（spareOverflow=false），c
 })
 
 test('forbid 档 + spareOverflow：溢出恢复放行（provider 已确认超限的兜底）', async () => {
-  const h = mockHarness({ tier: 'forbid', spareOverflow: true, engine: makeEngine({ result: { shadowedSeqs: [9] } }) })
+  const h = mockHarness({ tier: 'forbid', spareOverflow: true, tokens: 90000, engine: makeEngine({ result: { shadowedSeqs: [9] } }) })
   assert.equal(await attemptPressure(h), null)
   assert.deepEqual(await attemptOverflow(h), { shadowedSeqs: [9] }, 'spareOverflow 放行溢出')
 })
 
 test('temporary 档：压力/模型切换拦、溢出放行（临时/手动档永不拦溢出）', async () => {
-  const h = mockHarness({ tier: 'temporary' })
+  // tokens 85000 = 0.85：压缩点（0.8）之上、90% 切档之下——真实阈值穿越形态；
+  // engine result 非空使"拦截返回 null"与"放行返回 result"可区分
+  const h = mockHarness({ tier: 'temporary', tokens: 85000, engine: makeEngine({ result: { shadowedSeqs: [1] } }) })
   preStep(h, 1) // 武装临时窗 [1,3]
-  assert.equal(await attemptPressure(h), null)
+  assert.equal(await attemptPressure(h), null, '拦 = null（放行会返回 result）')
   assert.equal(await attemptSwitch(h), null)
   const overflowEngine = makeEngine({ result: { shadowedSeqs: [7] } })
   h.engine.result = { shadowedSeqs: [7] }
@@ -283,12 +285,47 @@ test('temporary 档：压力/模型切换拦、溢出放行（临时/手动档�
 })
 
 test('manual 档：压力拦+问、模型切换拦、溢出放行', async () => {
-  const h = mockHarness({ tier: 'manual' })
+  const h = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ result: { shadowedSeqs: [2] } }) })
   preStep(h, 1)
-  assert.equal(await attemptPressure(h), null) // 本回合首次：拦 + 亮条
-  assert.equal(await attemptSwitch(h), null) // 同回合重试：静默拦
+  assert.equal(await attemptPressure(h), null, '本回合首次：拦 + 亮条（result 非空使放行可区分）')
+  assert.equal(await attemptSwitch(h), null, '同回合重试：静默拦')
   h.engine.result = { shadowedSeqs: [5] }
   assert.deepEqual(await attemptOverflow(h), { shadowedSeqs: [5] }, '溢出放行')
+})
+
+test('压力门（v0.2.11）：占用未知（新会话首步）→ 放行，不拦不记事件', async () => {
+  // 真机 0.2.10 实锤：新对话第一轮 requestHeader() 未建立 → snapshot null，
+  // 旧逻辑把空探查当"压缩尝试"拦下 → 每个新对话第一轮弹假询问条。
+  // 引擎自身对这种情况也 no-op（compactIfNeeded 无 header 直接 null），放行 = 无插件时行为。
+  const h = mockHarness({ tier: 'manual', engine: makeEngine({ result: { shadowedSeqs: [1] } }) })
+  h.session.requestHeader = () => undefined
+  preStep(h, 1)
+  assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [1] }, '放行：原始方法被调用')
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '无拦截 trace')
+  const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
+  assert.equal(s.json.event, null, '无提示条事件（不亮条）')
+  // 形态二：meter 给不出有限 totalTokens（模型切换路径带 header 也一样未知）
+  h.ctx.tokenMeter.measure = () => ({ totalTokens: undefined })
+  assert.deepEqual(await attemptSwitch(h), { shadowedSeqs: [1] }, '模型切换路径同样放行')
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0)
+  // 溢出恢复不看占用率：forbid + 未知占用仍拦溢出（D2 语义不变）
+  const h2 = mockHarness({ tier: 'forbid' })
+  h2.session.requestHeader = () => undefined
+  assert.equal(await attemptOverflow(h2), null, 'forbid 溢出照拦')
+})
+
+test('压力门（v0.2.11）：占用已知但低于压缩点 → 放行；越过压缩点恢复拦截', async () => {
+  const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000, engine: makeEngine({ result: { shadowedSeqs: [2] } }) })
+  preStep(h, 1)
+  assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [2] }, '0.5 < 0.8 压缩点 → 放行（低压力不是压缩尝试）')
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '无拦截 trace')
+  // 压力涨到压缩点之上：恢复"尝试"语义，manual 照旧询问
+  h.ctx.tokenMeter.measure = () => ({ totalTokens: 90000 })
+  assert.equal(await attemptPressure(h), null, '0.9 ≥ 0.8 → 拦截 + 询问')
+  const blocked = traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked')
+  assert.equal(blocked.length, 1)
+  assert.equal(blocked[0].why, 'manual-ask')
+  assert.equal(blocked[0].occupancy, 0.9)
 })
 
 /* -------------------------------------------------------------------------- */
@@ -296,7 +333,7 @@ test('manual 档：压力拦+问、模型切换拦、溢出放行', async () => 
 /* -------------------------------------------------------------------------- */
 
 test('临时档：武装回合起拦 3 个回合，过期自动切回手动拒绝（tier-expired → manual）', async () => {
-  const h = mockHarness({ tier: 'temporary' })
+  const h = mockHarness({ tier: 'temporary', tokens: 85000 })
   preStep(h, 5) // 武装：expiresAtTurn = 7
   const armed = traceEvents(h.traceStart).find(e => e.ev === 'tier-armed')
   assert.equal(armed.turn, 5)
@@ -360,19 +397,19 @@ test('临时档 89% 不切档：保持临时档语义（拦但无询问）', asy
 /* -------------------------------------------------------------------------- */
 
 test('手动档：首次拦+亮条，同回合重试静默拦，allowOnce 放行，回合切换重问', async () => {
-  const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000 })
+  const h = mockHarness({ tier: 'manual', tokens: 90000, contextWindow: 100000 })
   preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '首次：拦截')
   const blocked = traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked')
   assert.equal(blocked.length, 1)
   assert.equal(blocked[0].why, 'manual-ask')
-  assert.equal(blocked[0].occupancy, 0.5)
+  assert.equal(blocked[0].occupancy, 0.9)
   // 提示条事件（phase=ask）
   const state1 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(state1.json.phase, 'ask')
   assert.equal(state1.json.tier, 'manual')
   assert.equal(state1.json.event.why, 'manual-ask')
-  assert.equal(state1.json.occupancy, 0.5)
+  assert.equal(state1.json.occupancy, 0.9)
   // 同回合重试：静默拦（不重复亮条，不触发原始方法）
   assert.equal(await attemptPressure(h), null)
   assert.equal(await attemptSwitch(h), null, '模型切换直调同样被拦')
@@ -399,9 +436,9 @@ test('手动档：首次拦+亮条，同回合重试静默拦，allowOnce 放行
 /* -------------------------------------------------------------------------- */
 
 test('全局改档：会话覆盖清除，按新全局档决策（global-tier-change trace）', async () => {
-  const h = mockHarness({ tier: 'temporary' })
+  const h = mockHarness({ tier: 'temporary', tokens: 85000 })
   preStep(h, 1)
-  assert.equal(await attemptPressure(h), null, 'temporary 生效')
+  assert.equal(await attemptPressure(h), null, 'temporary 生效（0.85 在压缩点上、90% 切档下）')
   // 用户改档（volatile 单元格现读）
   h.config.tier = cell('off')
   h.engine.result = { shadowedSeqs: [2] }
@@ -519,12 +556,13 @@ test('原始方法抛错 → 原样透传（不吞）', async () => {
   await assert.rejects(attemptOverflow(h), /boom from original/)
 })
 
-test('tokenMeter 缺席 → 占用率未知，档位决策照常（temporary 照拦）', async () => {
-  const h = mockHarness({ tier: 'temporary' })
+test('tokenMeter 缺席 → 占用率未知 → 空探查放行（v0.2.11 压力门；不崩、不切档）', async () => {
+  const h = mockHarness({ tier: 'temporary', engine: makeEngine({ result: { shadowedSeqs: [6] } }) })
   delete h.ctx.tokenMeter
   preStep(h, 1)
-  assert.equal(await attemptPressure(h), null, '占用率未知不阻碍拦截')
+  assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [6] }, '占用未知 → 放行（引擎自身也会 no-op）')
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'tier-switch').length, 0, '占用率未知不切档')
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '不记拦截')
 })
 
 /* -------------------------------------------------------------------------- */
@@ -532,7 +570,7 @@ test('tokenMeter 缺席 → 占用率未知，档位决策照常（temporary 照
 /* -------------------------------------------------------------------------- */
 
 test('compact-now：空闲 → ok + 本回合 allowOnce；忙 → busy 标记', async () => {
-  const h = mockHarness({ tier: 'manual' })
+  const h = mockHarness({ tier: 'manual', tokens: 90000 })
   preStep(h, 1)
   preStep(h, 1) // noteAgent 已记录 agent
   assert.equal(await attemptPressure(h), null) // 先拦一次（manual-ask）
@@ -546,7 +584,7 @@ test('compact-now：空闲 → ok + 本回合 allowOnce；忙 → busy 标记', 
   h.engine.result = { shadowedSeqs: [3] }
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [3] }, '手动压缩成功后本回合放行')
   // 忙：compactNow 抛 busy
-  const h2 = mockHarness({ tier: 'manual', engine: makeEngine({ failNow: Object.assign(new Error('manual compaction requires an idle agent with no waking queued work'), { kind: 'busy' }) }) })
+  const h2 = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ failNow: Object.assign(new Error('manual compaction requires an idle agent with no waking queued work'), { kind: 'busy' }) }) })
   preStep(h2, 1)
   preStep(h2, 1)
   const busy2 = await callRoute(h2, '/refuse-compaction/compact-now', { method: 'POST', query: `sessionId=${h2.sid}` })
@@ -569,7 +607,7 @@ test('compact-now：空闲 → ok + 本回合 allowOnce；忙 → busy 标记', 
 
 test('compact-now：非忙失败同样回落批准；非手动档（forbid）不回落', async () => {
   // 非忙失败（如摘要模型报错）：手动档回落批准
-  const h = mockHarness({ tier: 'manual', engine: makeEngine({ failNow: new Error('summarizer exploded') }) })
+  const h = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ failNow: new Error('summarizer exploded') }) })
   preStep(h, 1)
   preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '先拦一次（manual-ask）')
@@ -580,7 +618,7 @@ test('compact-now：非忙失败同样回落批准；非手动档（forbid）不
   h.engine.result = { shadowedSeqs: [9] }
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [9] }, '批准后放行（引擎自身路径重试）')
   // forbid 覆盖：busy 不回落（forbid 分支不查 allowOnceTurn，落了也不生效）
-  const h2 = mockHarness({ tier: 'manual', engine: makeEngine({ failNow: Object.assign(new Error('idle required'), { kind: 'busy' }) }) })
+  const h2 = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ failNow: Object.assign(new Error('idle required'), { kind: 'busy' }) }) })
   preStep(h2, 1)
   preStep(h2, 1)
   await callRoute(h2, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h2.sid}&mode=forbid` })
@@ -591,7 +629,7 @@ test('compact-now：非忙失败同样回落批准；非手动档（forbid）不
 })
 
 test('拦截计数：manual-repeat 递增，新回合归 1，state.json 按 refusedTurn 匹配供给', async () => {
-  const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000 })
+  const h = mockHarness({ tier: 'manual', tokens: 90000, contextWindow: 100000 })
   preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '首次 ask（计 1）')
   const s1 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
@@ -775,7 +813,7 @@ test('F1 数据链：decide 路径占用率与 state.json 快照同源（pressur
 /* -------------------------------------------------------------------------- */
 
 test('quiet temporary：本回合起拦 3 回合（事件带还剩N回合），到期切回 manual 询问', async () => {
-  const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000 })
+  const h = mockHarness({ tier: 'manual', tokens: 85000, contextWindow: 100000 })
   preStep(h, 4)
   assert.equal(await attemptPressure(h), null, 'manual 首次询问拦截')
   const quiet = await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=temporary` })
@@ -803,7 +841,7 @@ test('quiet temporary：本回合起拦 3 回合（事件带还剩N回合），�
 })
 
 test('quiet temporary（中断回合）：以询问条回合为锚武装，跳过死回合（还剩3/2/1 不跳档）', async () => {
-  const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000 })
+  const h = mockHarness({ tier: 'manual', tokens: 85000, contextWindow: 100000 })
   // 回合 5 被中断：pre-step 走了（currentTurn=5），turn-stopping 不走
   // （dsh-agent-loop 中止路径设 turnEnds={kind:'aborted'} 后 rethrow）
   preStep(h, 5)
@@ -829,7 +867,7 @@ test('quiet temporary（中断回合）：以询问条回合为锚武装，跳�
 })
 
 test('quiet forbid：本会话驳回全部自动压缩（含溢出），全局改档解除', async () => {
-  const h = mockHarness({ tier: 'manual' })
+  const h = mockHarness({ tier: 'manual', tokens: 90000 })
   preStep(h, 2)
   const quiet = await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=forbid` })
   assert.equal(quiet.json.ok, true)
@@ -844,7 +882,7 @@ test('quiet forbid：本会话驳回全部自动压缩（含溢出），全局�
 })
 
 test('clear-override：清会话覆盖（仪表快切配套），清后按全局档重新决策', async () => {
-  const h = mockHarness({ tier: 'manual' })
+  const h = mockHarness({ tier: 'manual', tokens: 90000 })
   preStep(h, 2)
   await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=forbid` })
   assert.equal(await attemptPressure(h), null, '覆盖生效中照拦')
@@ -864,7 +902,7 @@ test('clear-override：清会话覆盖（仪表快切配套），清后按全局
 })
 
 test('refuse：提示条翻"已拒绝"灰态，回合内后续静默拦，下一回合重新询问', async () => {
-  const h = mockHarness({ tier: 'manual' })
+  const h = mockHarness({ tier: 'manual', tokens: 90000 })
   preStep(h, 3)
   assert.equal(await attemptPressure(h), null, '首次询问拦截')
   const refused = await callRoute(h, '/refuse-compaction/refuse', { method: 'POST', query: `sessionId=${h.sid}` })

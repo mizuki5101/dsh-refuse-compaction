@@ -186,6 +186,20 @@ trace 与对话流状态一致。
 
 ## 版本
 
+- **0.2.11**：修**新对话第一轮弹假询问条**（真机 trace 实锤：每个新对话第一轮
+  `compaction-blocked {why:manual-ask, occupancy:null}`——占用远未达阈值、仪表不亮，
+  之后轮次正常）。根因：新会话首个 pre-step 时 `requestHeader()` 还没建立（meter
+  无投影基线）→ 占用率未知（null），旧逻辑把引擎的这次**空探查**当成"压缩尝试"
+  拦下——拦截档在占用率未知时一律拦截，且手动档在占用已知但**低于压缩点**时也拦
+  （档位分支没有任何占用率门）。修复：压力路径加**统一门**——占用率未知或
+  `totalTokens < compactionPoint` → 放行。安全性：引擎自身对这两种情况都 no-op
+  （`compactIfNeeded` 无 header/无路由目标直接返回 null；`compactPressure` 内
+  `measurement < thresholdTokens` 短路），放行 = 与无插件时行为完全一致。附带收益：
+  未装 dsh-compaction-policy 的环境（独立安装本插件的用户）里引擎每步都会调到包装，
+  此门同时避免低压力回合被反复询问。溢出恢复（D2）不看占用率，禁止档照拦；
+  联动分支的空探查同样静默放行不记事件。58 测试全绿（39 host + 19 client；
+  新增压力门两形态回归，旧"任何调用即尝试"语义的用例全部改为真实阈值穿越形态，
+  并补放行可区分断言）。
 - **0.2.10**：修**中断回合后临时窗倒数跳档**（用户实测：中断模型 → 手动询问 → 点
   "三回合内不再询问" → 3/1/1，"还剩2"被跳过；无中断时 3/2/1 正常）。根因：
   `agent/turn-stopping` 只在回合正常收尾时分发（dsh-agent-loop 中止路径设
@@ -270,7 +284,7 @@ trace 与对话流状态一致。
 
 ```bash
 npm install --no-save @deepseek-ai/schemastery@^3.18.2   # optional peer；lib 顶层 import 了它，测试挂载路径需要能解析（CI 同款）
-npm test                                                 # 56 条：37 host + 19 client
+npm test                                                 # 58 条：39 host + 19 client
 node scripts/render-demo.mjs                             # 生成 demo.html——双击可看全部 UI 状态与真实动画
 ```
 
