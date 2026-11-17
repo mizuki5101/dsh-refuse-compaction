@@ -91,7 +91,7 @@ function makeEngine({ result = null, failIfNeeded = false, failNow } = {}) {
 let sessionCounter = 0
 
 /** 组装 mock harness 并挂载插件。每条测试用唯一 sid，避免模块级状态串扰。 */
-function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOverflow = false, promptBar = true, engine = makeEngine(), compactionMissing = false, tierThrows = false, policyRow } = {}) {
+function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOverflow = false, promptBar = true, engine = makeEngine(), compactionMissing = false, tierThrows = false, policyRow, fence } = {}) {
   const traceStart = readTrace().length
   const listeners = {}
   const routes = new Map()
@@ -125,6 +125,11 @@ function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOv
     logger: {
       info() {},
       warn() {},
+    },
+    // 宿主连接栅栏（准入测试用）：不传 = 模拟老版 dsh 没有 requestRejection
+    ...(fence === undefined ? {} : { connection: fence }),
+    get(name) {
+      return name === 'connection' && fence !== undefined ? fence : undefined
     },
     inject(deps, cb) {
       assert.deepEqual([...deps], ['webServer'])
@@ -186,10 +191,10 @@ function attemptOverflow(h) {
   return h.engine.compactIfNeeded(h.agent, 'context-overflow', new AbortController().signal)
 }
 
-async function callRoute(h, routePath, { method = 'GET', query = '' } = {}) {
+async function callRoute(h, routePath, { method = 'GET', query = '', headers } = {}) {
   const handler = h.routes.get(routePath)
   assert.ok(handler, `route ${routePath} not registered`)
-  const req = { method, url: query === '' ? routePath : `${routePath}?${query}` }
+  const req = { method, url: query === '' ? routePath : `${routePath}?${query}`, ...(headers === undefined ? {} : { headers }) }
   const res = {
     code: 0,
     body: '',
@@ -697,7 +702,7 @@ test('state.json v2：现算压力快照（占用/token/窗口/压缩点/生效�
   assert.equal(s.json.occupancy, 162000 / 262144)
 })
 
-test('F2 直读 loader 行：compaction-policy 活配置修正压缩点（triggerRatio 0.75/0 形态）', async () => {
+test('F2 直读 loader 行：compaction-policy 活配置修正压缩点（用户机 0.75/0 形态）', async () => {
   const h = mockHarness({ tier: 'off', tokens: 162000, contextWindow: 262144, policyRow: { enabled: true, triggerRatio: 0.75, headroomTokens: 0 } })
   preStep(h, 1)
   const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
@@ -917,4 +922,90 @@ test('refuse：提示条翻"已拒绝"灰态，回合内后续静默拦，下一
   turnEnd(h, 3)
   preStep(h, 4)
   assert.equal(await attemptPressure(h), null, '下一回合重新询问')
+})
+
+/* -------------------------------------------------------------------------- */
+/* 9. 路由准入（v0.2.12）：本机网页不能改写档位                                  */
+/* -------------------------------------------------------------------------- */
+
+test('准入：宿主栅栏放行 → 路由照常执行', async () => {
+  const h = mockHarness({ tier: 'off', fence: { requestRejection: () => undefined } })
+  const state = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(state.code, 200)
+  assert.equal(state.json.phase, 'none')
+})
+
+test('准入：宿主栅栏回 403 → 拒绝且 handler 不执行', async () => {
+  const h = mockHarness({ tier: 'off', fence: { requestRejection: () => 403 } })
+  const refused = await callRoute(h, '/refuse-compaction/allow', { method: 'POST', query: `sessionId=${h.sid}` })
+  assert.equal(refused.code, 403)
+  assert.equal(refused.json.ok, false)
+  assert.equal(refused.json.error, 'forbidden')
+  const events = traceEvents(h.traceStart)
+  assert.ok(events.some(e => e.ev === 'route-rejected' && e.status === 403), '拒绝必须留痕')
+})
+
+test('准入：宿主栅栏回 401 → 区分未认证', async () => {
+  const h = mockHarness({ tier: 'off', fence: { requestRejection: () => 401 } })
+  const refused = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(refused.code, 401)
+  assert.equal(refused.json.error, 'unauthorized')
+})
+
+test('准入：栅栏自身抛异常 → 403（fail-closed，绝不静默放行）', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    fence: { requestRejection: () => { throw new Error('boom') } },
+  })
+  const res = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(res.code, 403)
+  assert.ok(traceEvents(h.traceStart).some(e => e.ev === 'route-fence-error'))
+})
+
+test('准入：无栅栏时跨站 Origin 被拒；DNS 重绑定的同源相等也不行', async () => {
+  const h = mockHarness({ tier: 'off' })
+  const cross = await callRoute(h, '/refuse-compaction/allow', {
+    method: 'POST',
+    query: `sessionId=${h.sid}`,
+    headers: { host: '127.0.0.1:5173', origin: 'http://evil.example' },
+  })
+  assert.equal(cross.code, 403, '跨站 Origin 必须拒')
+  // 重绑定：Origin 与 Host 相同，但 Host 不是回环权威 —— 这一层是 Origin 相等拦不住的
+  const rebound = await callRoute(h, '/refuse-compaction/allow', {
+    method: 'POST',
+    query: `sessionId=${h.sid}`,
+    headers: { host: 'evil.example', origin: 'http://evil.example' },
+  })
+  assert.equal(rebound.code, 403, '非回环 Host 必须拒')
+  const sandboxed = await callRoute(h, '/refuse-compaction/allow', {
+    method: 'POST',
+    query: `sessionId=${h.sid}`,
+    headers: { host: '127.0.0.1:5173', origin: 'null' },
+  })
+  assert.equal(sandboxed.code, 403, 'Origin: null（沙箱 iframe / data: 文档）必须拒')
+})
+
+test('准入：无栅栏时同源回环放行；Host 缺失也放行（桌面代理会剥掉头再签 cookie）', async () => {
+  const h = mockHarness({ tier: 'off' })
+  const sameOrigin = await callRoute(h, '/refuse-compaction/state.json', {
+    query: `sessionId=${h.sid}`,
+    headers: { host: '127.0.0.1:5173', origin: 'http://127.0.0.1:5173' },
+  })
+  assert.equal(sameOrigin.code, 200, '同源回环是仪表自己的调用')
+  const localhost = await callRoute(h, '/refuse-compaction/state.json', {
+    query: `sessionId=${h.sid}`,
+    headers: { host: 'localhost:5173' },
+  })
+  assert.equal(localhost.code, 200)
+  const stripped = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(stripped.code, 200, '无 Host（被代理剥离）不得误伤')
+})
+
+test('准入：回环逐段校验，127.0.0.1.evil.example 不算回环', async () => {
+  const h = mockHarness({ tier: 'off' })
+  const res = await callRoute(h, '/refuse-compaction/state.json', {
+    query: `sessionId=${h.sid}`,
+    headers: { host: '127.0.0.1.evil.example' },
+  })
+  assert.equal(res.code, 403)
 })
