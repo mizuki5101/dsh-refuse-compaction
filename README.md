@@ -181,7 +181,8 @@ tar -xzf dsh-refuse-compaction-0.2.10.tgz \
 
 ## 兼容性
 
-- `dsh.verifiedWith: 0.2.2-rc.3`——在该版本上开发并真机验证。
+- `dsh.verifiedWith: 0.2.3-alpha.2`——在该版本上开发并真机验证（0.2.13 起更新；
+  此前声明为 0.2.2-rc.3，中间版本的接缝未变，故未做代码改动）。
 - dsh 升级后若内部接缝变化（引擎方法改名等），插件 feature-detect **自禁用**
   （不抛错、不影响 dsh 运行），追踪文件出现 `mount-fail` 事件说明原因。
 - 排查入口：`~/.dsh/refuse-compaction-trace.ndjson`（`mounted` / `mount-fail` /
@@ -211,6 +212,13 @@ trace 与对话流状态一致。
 
 ## 版本
 
+- **0.2.13**：仅更新兼容性声明（`dsh.verifiedWith` → `0.2.3-alpha.2`），无功能变更。
+  在 0.2.3-alpha.2 上复核：`agentPresets.serviceFor(agent,'compaction')`、
+  `compactIfNeeded` / `compactPressure(agent,header,signal,requireBelowThreshold)` 签名、
+  `agent/pre-step`、`agent/turn-stopping`、`tokenMeter.measure().totalTokens`、
+  `llm.resolveModelInfo` 均未变；65 项测试全绿，启动 trace `mounted` + `policy-scan` 正常
+  （读到 compaction-policy 活配置 `enabled=true / triggerRatio=0.75 / headroomTokens=0`）。
+- **0.2.12**：六条路由加入口准入（`connection.requestRejection` + 回环兜底）。
 - **0.2.11**：修**新对话第一轮弹假询问条**（真机 trace 实锤：每个新对话第一轮
   `compaction-blocked {why:manual-ask, occupancy:null}`——占用远未达阈值、仪表不亮，
   之后轮次正常）。根因：新会话首个 pre-step 时 `requestHeader()` 还没建立（meter
