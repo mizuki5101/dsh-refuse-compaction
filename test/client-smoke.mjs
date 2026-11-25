@@ -198,20 +198,27 @@ test('apply 注册双语词典 + settings.section（order 57 紧跟 exa-distill�
   assert.equal(harness.turnTailSlot.def.inject('session-x').sessionId, 'session-x', 'session 作用域注入 sessionId')
 })
 
-test('Section 就绪态渲染 4 个字段；档位下拉 4 个选项', () => {
+test('Section 就绪态渲染 8 个字段；档位 / 自动恢复 / 输出守门三个下拉', () => {
   const { exports } = loadClient()
   const harness = fakeCtx()
   exports.apply(harness.ctx)
   const props = harness.settingsSlot.def.inject()
   const node = harness.settingsSlot.component(props)
   const found = collect(node)
-  for (const key of ['tierLabel', 'spareOverflowLabel', 'promptBarLabel', 'revealAheadLabel']) {
+  for (const key of [
+    'tierLabel', 'spareOverflowLabel', 'promptBarLabel', 'revealAheadLabel',
+    'autoResumeLabel', 'autoResumeMaxLabel', 'autoResumeMinTailLabel', 'outputGuardLabel',
+  ]) {
     assert.ok(found.ids.has(`refuse-compaction.${key}`), `缺少字段 ${key}`)
   }
-  assert.equal(found.selects.length, 1, '档位是下拉选择')
+  assert.equal(found.selects.length, 3, '档位 / 自动恢复 / 输出守门都是下拉选择')
   // h('select', props, options.map(...)) 的 children 是嵌套一层的数组
   const options = found.selects[0].children.flat(Infinity).filter(c => c && c.tag === 'option')
   assert.deepEqual(options.map(o => o.props.value), ['off', 'temporary', 'manual', 'forbid'])
+  const resumeOptions = found.selects[1].children.flat(Infinity).filter(c => c && c.tag === 'option')
+  assert.deepEqual(resumeOptions.map(o => o.props.value), ['off', 'continue', 'recover'])
+  const guardOptions = found.selects[2].children.flat(Infinity).filter(c => c && c.tag === 'option')
+  assert.deepEqual(guardOptions.map(o => o.props.value), ['auto', 'off'])
 })
 
 test('Section 交互：下拉改档写 form.set(tier)；开关切换写 form.set', () => {
@@ -630,4 +637,15 @@ test('F1 仪表交互：档位按钮写 form.set(tier)；覆盖生效时附带�
   const next = updater({ tier: 'temporary', globalTier: 'manual' })
   assert.equal(next.tier, 'manual')
   assert.equal(next.globalTier, 'manual')
+})
+
+test('barText：自动恢复三形态（resumed/recovered/exhausted）不复述占用率', () => {
+  const { barText } = loadClient().exports
+  const resumed = barText({ phase: 'resumed', event: { kind: 'resume', attempt: 1, max: 2 }, occupancy: 0.11 }, t)
+  assert.match(resumed, /已自动继续（1\/2）/)
+  assert.doesNotMatch(resumed, /11%/, '恢复形态不拼占用率')
+  const recovered = barText({ phase: 'recovered', event: { kind: 'resumed', attempt: 2, max: 2 }, occupancy: 0.7 }, t)
+  assert.match(recovered, /已压缩历史并自动继续（2\/2）/)
+  const exhausted = barText({ phase: 'exhausted', event: { kind: 'resume', attempt: 2, max: 2 }, occupancy: 0.7 }, t)
+  assert.match(exhausted, /已达上限（2\/2）/)
 })

@@ -76,6 +76,62 @@ decide()（绝不抛错，异常一律放行）：
   （如精简落盘缩了上下文、不再触发尝试），批准自然过期不消费。仅手动档回落——
   禁止/临时分支不查批准（落了也不生效）。
 
+## 截断自动恢复（v0.2.14，与四档解耦）
+
+回合以 `turn/end.reason = 'max-tokens'`（模型输出撞到请求的 `maxTokens`）结束时，
+不再等你手动发「继续」：
+
+1. `turn/end` 事件里判定（用户已排队输入 / 已取消 / 达上限 → 不动作）；
+2. `agent.followup()` 排一条 `继续。`，source 是本插件自己的 kind
+   （`refuse-compaction:auto-resume`，会话校验只要求 kind 非空）；
+3. `recover` 档且**剩余输出空间不足**时，在下一轮 `pre-step` 里调引擎公开的
+   `compactRegion`：范围 = 第一个非 system 节点 → **被截断回合之前**的最后一个节点，
+   边界按 tool-call/result 配对平衡回退；被截断这一轮原样留在 surface 上，
+   "摘要 + 最新一轮"的拼接就是 surface 顺序本身；
+4. 摘要走包装后的 `engine.summarize`：会话自己的 system/tools/消息前缀照旧（KV 缓存
+   仍命中），末尾追加一段**只读**的「被截断轮可见内容」（text + 工具名，**不含
+   reasoning**），并要求摘要的 `Current Work` / `Next Step` 据此判断；摘要请求单独设
+   `maxTokens = 4096`，绝不复用会话那 32k/256k 的输出预留；
+5. 压缩成功后本回合引擎不再二次压缩（`resume-hold`），避免把刚保留的那一轮也压掉；
+6. 任一步失败 → 降级为「只继续」，绝不卡死会话。
+
+**做不到的一条**：那句「已达到输出 token 上限」是 `turn/end` 的持久记录
+（客户端 `TurnMaxTokensItem` 注释原文 *persistent, turn-positioned*），插件撤回不了；
+本插件只在提示条上加一条「已自动恢复 N/M」的状态。
+
+## 输出预算守门（v0.2.16）
+
+压缩点是「窗口 − 单次输出上限」和「窗口 × 触发比例」里**更小**的那个：后台的
+`dsh-compaction-policy` 用 `min(W×triggerRatio, W−O−headroom)` 计算，`O` 就是模型页
+那个 `maxTokens`。本地小窗口模型上 `W−O` 通常更小，所以压缩点落在 46% 附近而不是
+75% —— 这是把输出空间提前留出来了，不是配置错误。
+
+也因此，只要压缩正常工作，prompt 永远到不了溢出边界；**只有压缩被拦住或失败时**，
+它才会越过去，接着那次请求就会被服务端直接拒绝。守门只在那一刻接管：
+
+```
+outputGuard === 'auto'                // 独立开关（默认开）
+生效档位 !== 'off'                     // 关闭档 = 完全放手，连输出预算也不干预
+measured >= compactionPoint           // 该压没压，才动手
+budget = W − measured − 4096          // 4096 留给本轮还没进 surface 的消息
+if budget < configured → maxTokens = budget
+if budget < 1024      → 放弃（写不出东西），交给溢出恢复
+```
+
+**任何非「关闭」档都会生效**（temporary / manual / forbid），不只是禁止档 ——
+只是禁止档最容易复现「越线却没被压」这个前提。
+
+**为什么门要开在压缩点之后**：`agent/request` 改 `maxTokens` 会被写进
+`request/header`（`headerEquals` 用 `callConfigEquals` 比较它），而
+dsh-compaction-policy 的压缩点按最新 header 的 `O` 计价。若在压缩点之前就压预算，
+压缩点会跟着后移，形成「越压越不压」的正反馈。限定在越线之后，正常回合完全不碰；
+压缩一旦成功，header 回到配置值，压缩点自行复原。代价是越线后压缩点最多被推后
+一次 `4096`，之后按 4k 一阶跟随。
+
+仪表会提前告知：「上下文余量已贴近输出上限，将自动压低允许的上限值 · 32,768 → 26,336」。
+仪表的出现阈值（`compactionPoint × (1 − revealAhead)`）早于守门触发点，所以这句提醒
+不会晚于仪表出现。
+
 ## 与 dsh-exa-distill 联动（"精简结果替换前不压缩"）
 
 两个插件都在时，exa-distill（≥0.2.7）设置里出现"**精简结果替换前不压缩**"复选框。
@@ -156,6 +212,10 @@ tar -xzf dsh-refuse-compaction-0.2.10.tgz \
 | `spareOverflow` | `false` | true =「禁止」档也放行溢出恢复（provider 已确认超限时的兜底压缩） |
 | `promptBar` | `true` | 对话内提示条：拦截发生时在该回合尾部显示档位/原因/占用率；manual 档带四键询问条（立即压缩/拒绝压缩/三回合内不再询问/不再询问） |
 | `revealAhead` | `0.2` | F1 占用仪表提前量：距压缩点不足这个比例时在对话流尾部亮出环形仪表 + 四档快切；未达阈值不展示 |
+| `autoResume` | `off` | 截断自动恢复：回合以「输出 token 上限」结束时自动代发「继续」。`off` / `continue`（只继续）/ `recover`（先压缩被截断轮之前的历史再继续）。**与四档解耦** |
+| `autoResumeMax` | `2` | 连续自动恢复上限；用户自己发消息即重置计数 |
+| `autoResumeMinTail` | `8192` | `recover` 档的压缩门槛：剩余输出空间不足时先压缩，否则只继续 |
+| `outputGuard` | `auto` | 输出预算守门：历史越过压缩点却没被压（被拒/失败）时，把本次请求的 `maxTokens` 压到「窗口 − 已用 − 4096」，避免 provider 直接报超限；**仅在档位非「关闭」时生效**；`off` 关闭 |
 
 **F1 占用仪表**：上下文距压缩点不足 `revealAhead` 时，对话流最后回合尾部出现仪表条
 ——环形进度（复用 ContextMeter 视觉语言）+ 主文本 `X%（已用 / 压缩点）`（X% =
@@ -205,6 +265,10 @@ tar -xzf dsh-refuse-compaction-0.2.10.tgz \
 | `allow-once` / `compact-now` / `compact-queued` | 提示条按钮动作（compact-now 带 ok/busy；compact-queued = 忙碌批准回落，带 throughTurn） |
 | `quiet` / `refused` / `override-clear` | 询问条按钮动作 / 清会话覆盖（仪表档位快切配套） |
 | `decide-error` | 决策异常（fallback= allow，D3） |
+| `resume-fire` / `resume-skip` / `resume-exhausted` | 自动恢复已排队（含 compress / remaining）/ 跳过原因 / 达上限 |
+| `resume-compact` / `resume-compact-skip` / `resume-compact-fail` | 恢复压缩落地（brokenTurn / 范围 / shadowed）/ 跳过 / 失败降级 |
+| `resume-hold` / `resume-summary-fallback` | 恢复压缩后本回合不再二次压缩 / 无旁路通道时退回引擎自带摘要 |
+| `output-guard` / `output-guard-skip` / `output-guard-error` | 输出预算被压（configured → clamped）/ 压到 1024 以下放弃 / 守门异常 |
 
 真机验证路径：设置里切"手动拒绝" → 聊到压缩阈值附近 → 看到提示条 →
 点[立即压缩]（忙碌时自动转"已批准：下一个压缩检查点"）或[三回合内不再询问] →
@@ -212,6 +276,18 @@ trace 与对话流状态一致。
 
 ## 版本
 
+- **0.2.17**：设置页八条描述全部改写——去掉公式和内部变量名，统一为「上下文窗口 /
+  单次输出上限 / 压缩点 / 剩余输出空间」四个词，每条只讲「什么时候生效、会发生什么」。
+- **0.2.16**：输出预算守门（`outputGuard`，独立开关）。历史越过压缩点却没被压时，把本次
+  请求的 `maxTokens` 压到「窗口 − 已用 − 4096」，避免 provider 直接报超限；仅在档位非
+  「关闭」时生效；门开在压缩点之后，避免 header 变小反过来推后压缩点。仪表增加
+  「上下文余量已贴近输出上限」提醒。
+- **0.2.14**：截断自动恢复（`autoResume` / `autoResumeMax` / `autoResumeMinTail`）。
+  `turn/end(max-tokens)` → 自动 `followup("继续")`；`recover` 档在剩余输出空间不足时
+  先压缩「被截断轮之前」的历史（`compactRegion` + 平衡回退），被截断轮原样保留；
+  摘要包装 `engine.summarize` 追加只读尾部（不含 reasoning）并独立设 4096 输出上限；
+  压缩后本回合 `resume-hold` 防二次压缩；失败一律降级为只继续。
+  **pre-step 监听器改为 async**（压缩必须在 turn 内执行）。截断提示本身无法撤回。
 - **0.2.13**：仅更新兼容性声明（`dsh.verifiedWith` → `0.2.3-alpha.2`），无功能变更。
   在 0.2.3-alpha.2 上复核：`agentPresets.serviceFor(agent,'compaction')`、
   `compactIfNeeded` / `compactPressure(agent,header,signal,requireBelowThreshold)` 签名、
@@ -317,7 +393,7 @@ trace 与对话流状态一致。
 
 ```bash
 npm install --no-save @deepseek-ai/schemastery@^3.18.2   # optional peer；lib 顶层 import 了它，测试挂载路径需要能解析（CI 同款）
-npm test                                                 # 58 条：39 host + 19 client
+npm test                                                 # 87 条：65 host + 22 client
 node scripts/render-demo.mjs                             # 生成 demo.html——双击可看全部 UI 状态与真实动画
 ```
 

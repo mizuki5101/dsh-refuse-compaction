@@ -51,11 +51,15 @@ function cell(value) {
   return { get: () => value }
 }
 
-function makeConfig({ tier = 'off', spareOverflow = false, promptBar = true, tierThrows = false } = {}) {
+function makeConfig({ tier = 'off', spareOverflow = false, promptBar = true, tierThrows = false, autoResume = 'off', autoResumeMax = 2, autoResumeMinTail = 8192, outputGuard = 'auto' } = {}) {
   return {
     tier: tierThrows ? { get() { throw new Error('cell exploded') } } : cell(tier),
     spareOverflow: cell(spareOverflow),
     promptBar: cell(promptBar),
+    autoResume: cell(autoResume),
+    autoResumeMax: cell(autoResumeMax),
+    autoResumeMinTail: cell(autoResumeMinTail),
+    outputGuard: cell(outputGuard),
   }
 }
 
@@ -63,11 +67,13 @@ function makeConfig({ tier = 'off', spareOverflow = false, promptBar = true, tie
  * mock CompactionEngine：记录三方法调用；compactIfNeeded('pressure') 内部
  * this.compactPressure（与 basic 引擎同款内部形态，检验包装幂等）。
  */
-function makeEngine({ result = null, failIfNeeded = false, failNow } = {}) {
+function makeEngine({ result = null, failIfNeeded = false, failNow, failRegion } = {}) {
   const engine = {
     ifNeededCalls: [],
     pressureCalls: [],
     nowCalls: [],
+    regionCalls: [],
+    summarizeCalls: [],
     result,
     async compactIfNeeded(agent, trigger, signal) {
       engine.ifNeededCalls.push({ trigger })
@@ -84,6 +90,25 @@ function makeEngine({ result = null, failIfNeeded = false, failNow } = {}) {
       if (failNow) throw failNow
       return { shadowedSeqs: [1, 2] }
     },
+    // 自动恢复走的公开压缩入口（引擎侧 fixed owner='current-turn'）；
+    // 内部调用 this.summarize 与 basic 引擎一致，让摘要包装能被真实命中。
+    async compactRegion(start, end, agent, signal) {
+      engine.regionCalls.push({ start, end })
+      if (failRegion) throw failRegion
+      await engine.summarize({ messages: [{ role: 'user', content: [{ type: 'text', text: 'history' }] }] }, agent, signal)
+      return { shadowedSeqs: [start, end], startSeq: start, endSeq: end }
+    },
+    // protected 摘要钩子（实例属性遮蔽的包装目标）
+    async summarize(input, agent, signal) {
+      engine.summarizeCalls.push({ input })
+      return {
+        summary: [{ type: 'text', text: 'default-summary' }],
+        rawOutput: [{ type: 'text', text: 'default-summary' }],
+        llmStreamCall: true,
+        provider: 'test-provider',
+        model: 'test-model',
+      }
+    },
   }
   return engine
 }
@@ -91,7 +116,25 @@ function makeEngine({ result = null, failIfNeeded = false, failNow } = {}) {
 let sessionCounter = 0
 
 /** 组装 mock harness 并挂载插件。每条测试用唯一 sid，避免模块级状态串扰。 */
-function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOverflow = false, promptBar = true, engine = makeEngine(), compactionMissing = false, tierThrows = false, policyRow, fence } = {}) {
+function mockHarness({
+  contextWindow = 100000,
+  tokens = 0,
+  tier = 'off',
+  spareOverflow = false,
+  promptBar = true,
+  engine = makeEngine(),
+  compactionMissing = false,
+  tierThrows = false,
+  policyRow,
+  fence,
+  autoResume = 'off',
+  autoResumeMax = 2,
+  autoResumeMinTail = 8192,
+  outputGuard = 'auto',
+  maxTokens,
+  surfaceEvents,
+  llmStream,
+} = {}) {
   const traceStart = readTrace().length
   const listeners = {}
   const routes = new Map()
@@ -121,6 +164,9 @@ function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOv
     },
     llm: {
       resolveModelInfo: async () => ({ context: { contextWindow } }),
+      // 旁路摘要用（自动恢复的 summarizeWithTail）：默认实现为空流，
+      // 需要真实摘要的测试显式传 llmStream。
+      ...(llmStream === undefined ? {} : { stream: llmStream }),
     },
     logger: {
       info() {},
@@ -147,13 +193,31 @@ function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOv
   }
   sessionCounter += 1
   const sid = `session-${sessionCounter}`
+  // surface：surfaceEvents 提供 [(seq, type, data)]，默认空表面（不参与自动恢复）
+  const eventLog = new Map()
+  const surfaceNodes = []
+  for (const entry of surfaceEvents ?? []) {
+    eventLog.set(entry.seq, entry)
+    surfaceNodes.push(entry.seq)
+  }
   const session = {
     id: sid,
     header: { id: sid },
-    requestHeader: () => ({ config: { provider: 'test-provider', model: 'test-model' } }),
+    requestHeader: () => ({ config: { provider: 'test-provider', model: 'test-model', ...(maxTokens === undefined ? {} : { maxTokens }) } }),
+    surface: { nodes: surfaceNodes, replaceGeneration: 0 },
+    eventAt: (seq) => eventLog.get(seq),
+    toolHistory: () => undefined,
   }
-  const agent = { session }
-  const config = makeConfig({ tier, spareOverflow, promptBar, tierThrows })
+  const agent = {
+    session,
+    inbox: { nextTurn: [], nextStep: [] },
+    followups: [],
+    followup(message) {
+      agent.followups.push(message)
+      agent.inbox.nextTurn.push(message)
+    },
+  }
+  const config = makeConfig({ tier, spareOverflow, promptBar, tierThrows, autoResume, autoResumeMax, autoResumeMinTail, outputGuard })
   apply(ctx, config)
   // 自动探针：触发一次包装安装（turn=0 → 不记回合、不武装临时窗），
   // 模拟真实时序里 pre-step 先于首次压缩尝试。显式 preStep 调用保持幂等。
@@ -163,10 +227,10 @@ function mockHarness({ contextWindow = 100000, tokens = 0, tier = 'off', spareOv
 
 /* --- 事件驱动辅助（对齐真实触发点：pre-step / turn-stopping / 三调用点） --- */
 
-function preStep(h, turn) {
+async function preStep(h, turn, messages = []) {
   assert.ok(h.listeners['agent/pre-step'], 'apply 未注册 agent/pre-step')
   const decision = { kind: 'enter' }
-  const returned = h.listeners['agent/pre-step']({ agent: h.agent, messages: [], turn, step: 1, signal: new AbortController().signal, modelSelection: { provider: 'test-provider', model: 'test-model' } }, () => decision)
+  const returned = await h.listeners['agent/pre-step']({ agent: h.agent, messages, turn, step: 1, signal: new AbortController().signal, modelSelection: { provider: 'test-provider', model: 'test-model' } }, () => decision)
   assert.equal(returned, decision, 'pre-step 监听器必须透传 next() 的决策')
 }
 
@@ -222,14 +286,14 @@ test('挂载：mounted trace + 探针自动安装包装（engine-instrumented）
   assert.equal(typeof h.engine.compactNow, 'function')
 })
 
-test('自禁用：agentPresets 服务缺席 → mount-fail，apply 不抛，监听器照常', () => {
+test('自禁用：agentPresets 服务缺席 → mount-fail，apply 不抛，监听器照常', async () => {
   const h = mockHarness({ compactionMissing: true })
   const events = traceEvents(h.traceStart)
   assert.equal(events[0].ev, 'mount-fail')
   assert.equal(events[0].why, 'agentPresets service missing')
   // 回合追踪/路由等其余功能不受影响；探针/显式 preStep 静默（无引擎可包装）
   assert.ok(h.listeners['agent/pre-step'])
-  preStep(h, 1)
+  await preStep(h, 1)
   turnEnd(h, 1)
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'engine-instrumented').length, 0)
 })
@@ -281,7 +345,7 @@ test('temporary 档：压力/模型切换拦、溢出放行（临时/手动档�
   // tokens 85000 = 0.85：压缩点（0.8）之上、90% 切档之下——真实阈值穿越形态；
   // engine result 非空使"拦截返回 null"与"放行返回 result"可区分
   const h = mockHarness({ tier: 'temporary', tokens: 85000, engine: makeEngine({ result: { shadowedSeqs: [1] } }) })
-  preStep(h, 1) // 武装临时窗 [1,3]
+  await preStep(h, 1) // 武装临时窗 [1,3]
   assert.equal(await attemptPressure(h), null, '拦 = null（放行会返回 result）')
   assert.equal(await attemptSwitch(h), null)
   const overflowEngine = makeEngine({ result: { shadowedSeqs: [7] } })
@@ -291,7 +355,7 @@ test('temporary 档：压力/模型切换拦、溢出放行（临时/手动档�
 
 test('manual 档：压力拦+问、模型切换拦、溢出放行', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ result: { shadowedSeqs: [2] } }) })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '本回合首次：拦 + 亮条（result 非空使放行可区分）')
   assert.equal(await attemptSwitch(h), null, '同回合重试：静默拦')
   h.engine.result = { shadowedSeqs: [5] }
@@ -304,7 +368,7 @@ test('压力门（v0.2.11）：占用未知（新会话首步）→ 放行，不
   // 引擎自身对这种情况也 no-op（compactIfNeeded 无 header 直接 null），放行 = 无插件时行为。
   const h = mockHarness({ tier: 'manual', engine: makeEngine({ result: { shadowedSeqs: [1] } }) })
   h.session.requestHeader = () => undefined
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [1] }, '放行：原始方法被调用')
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '无拦截 trace')
   const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
@@ -321,7 +385,7 @@ test('压力门（v0.2.11）：占用未知（新会话首步）→ 放行，不
 
 test('压力门（v0.2.11）：占用已知但低于压缩点 → 放行；越过压缩点恢复拦截', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 50000, contextWindow: 100000, engine: makeEngine({ result: { shadowedSeqs: [2] } }) })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [2] }, '0.5 < 0.8 压缩点 → 放行（低压力不是压缩尝试）')
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '无拦截 trace')
   // 压力涨到压缩点之上：恢复"尝试"语义，manual 照旧询问
@@ -339,19 +403,19 @@ test('压力门（v0.2.11）：占用已知但低于压缩点 → 放行；越�
 
 test('临时档：武装回合起拦 3 个回合，过期自动切回手动拒绝（tier-expired → manual）', async () => {
   const h = mockHarness({ tier: 'temporary', tokens: 85000 })
-  preStep(h, 5) // 武装：expiresAtTurn = 7
+  await preStep(h, 5) // 武装：expiresAtTurn = 7
   const armed = traceEvents(h.traceStart).find(e => e.ev === 'tier-armed')
   assert.equal(armed.turn, 5)
   assert.equal(armed.expiresAtTurn, 7)
   assert.equal(await attemptPressure(h), null, '回合 5 拦')
   turnEnd(h, 5)
-  preStep(h, 6)
+  await preStep(h, 6)
   assert.equal(await attemptPressure(h), null, '回合 6 拦')
   turnEnd(h, 6)
-  preStep(h, 7)
+  await preStep(h, 7)
   assert.equal(await attemptPressure(h), null, '回合 7 拦')
   turnEnd(h, 7)
-  preStep(h, 8)
+  await preStep(h, 8)
   assert.equal(await attemptPressure(h), null, '回合 8 过期 → 切回手动拒绝，本回合首次询问')
   const expired = traceEvents(h.traceStart).find(e => e.ev === 'tier-expired')
   assert.ok(expired, '过期有 trace')
@@ -369,7 +433,7 @@ test('临时档：武装回合起拦 3 个回合，过期自动切回手动拒�
 
 test('临时档 90% 切档：占用率 ≥0.9 → manual 语义接管（询问/放行/重问）', async () => {
   const h = mockHarness({ tier: 'temporary', tokens: 92000, contextWindow: 100000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '0.92 ≥ 0.9 → 切 manual 后按 manual 首问拦截')
   const switched = traceEvents(h.traceStart).find(e => e.ev === 'tier-switch')
   assert.ok(switched, 'tier-switch trace')
@@ -382,13 +446,13 @@ test('临时档 90% 切档：占用率 ≥0.9 → manual 语义接管（询问/�
   h.engine.result = { shadowedSeqs: [1] }
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [1] }, 'allowOnce 放行')
   turnEnd(h, 1)
-  preStep(h, 2)
+  await preStep(h, 2)
   assert.equal(await attemptPressure(h), null, '下一回合重新询问')
 })
 
 test('临时档 89% 不切档：保持临时档语义（拦但无询问）', async () => {
   const h = mockHarness({ tier: 'temporary', tokens: 89000, contextWindow: 100000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null)
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'tier-switch').length, 0)
   const blocked = traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked')
@@ -403,7 +467,7 @@ test('临时档 89% 不切档：保持临时档语义（拦但无询问）', asy
 
 test('手动档：首次拦+亮条，同回合重试静默拦，allowOnce 放行，回合切换重问', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000, contextWindow: 100000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '首次：拦截')
   const blocked = traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked')
   assert.equal(blocked.length, 1)
@@ -429,7 +493,7 @@ test('手动档：首次拦+亮条，同回合重试静默拦，allowOnce 放行
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [4] }, 'allowOnce 放行')
   // 回合切换：allowOnce/refusedTurn 失效 → 重新询问
   turnEnd(h, 1)
-  preStep(h, 2)
+  await preStep(h, 2)
   assert.equal(await attemptPressure(h), null, '回合 2 重新询问')
   const reAsk = traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked' && e.turn === 2)
   assert.equal(reAsk.length, 1)
@@ -442,7 +506,7 @@ test('手动档：首次拦+亮条，同回合重试静默拦，allowOnce 放行
 
 test('全局改档：会话覆盖清除，按新全局档决策（global-tier-change trace）', async () => {
   const h = mockHarness({ tier: 'temporary', tokens: 85000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, 'temporary 生效（0.85 在压缩点上、90% 切档下）')
   // 用户改档（volatile 单元格现读）
   h.config.tier = cell('off')
@@ -564,7 +628,7 @@ test('原始方法抛错 → 原样透传（不吞）', async () => {
 test('tokenMeter 缺席 → 占用率未知 → 空探查放行（v0.2.11 压力门；不崩、不切档）', async () => {
   const h = mockHarness({ tier: 'temporary', engine: makeEngine({ result: { shadowedSeqs: [6] } }) })
   delete h.ctx.tokenMeter
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.deepEqual(await attemptPressure(h), { shadowedSeqs: [6] }, '占用未知 → 放行（引擎自身也会 no-op）')
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'tier-switch').length, 0, '占用率未知不切档')
   assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'compaction-blocked').length, 0, '不记拦截')
@@ -576,8 +640,8 @@ test('tokenMeter 缺席 → 占用率未知 → 空探查放行（v0.2.11 压力
 
 test('compact-now：空闲 → ok + 本回合 allowOnce；忙 → busy 标记', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000 })
-  preStep(h, 1)
-  preStep(h, 1) // noteAgent 已记录 agent
+  await preStep(h, 1)
+  await preStep(h, 1) // noteAgent 已记录 agent
   assert.equal(await attemptPressure(h), null) // 先拦一次（manual-ask）
   const busy = await callRoute(h, '/refuse-compaction/compact-now', {
     method: 'POST',
@@ -613,8 +677,8 @@ test('compact-now：空闲 → ok + 本回合 allowOnce；忙 → busy 标记', 
 test('compact-now：非忙失败同样回落批准；非手动档（forbid）不回落', async () => {
   // 非忙失败（如摘要模型报错）：手动档回落批准
   const h = mockHarness({ tier: 'manual', tokens: 90000, engine: makeEngine({ failNow: new Error('summarizer exploded') }) })
-  preStep(h, 1)
-  preStep(h, 1)
+  await preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '先拦一次（manual-ask）')
   const failed = await callRoute(h, '/refuse-compaction/compact-now', { method: 'POST', query: `sessionId=${h.sid}` })
   assert.equal(failed.json.ok, false)
@@ -635,7 +699,7 @@ test('compact-now：非忙失败同样回落批准；非手动档（forbid）不
 
 test('拦截计数：manual-repeat 递增，新回合归 1，state.json 按 refusedTurn 匹配供给', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000, contextWindow: 100000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null, '首次 ask（计 1）')
   const s1 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(s1.json.repeatCount, 1)
@@ -647,7 +711,7 @@ test('拦截计数：manual-repeat 递增，新回合归 1，state.json 按 refu
   const sOld = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=9` })
   assert.equal(sOld.json.repeatCount, null, '回合不匹配不供给（老条不串数）')
   turnEnd(h, 1)
-  preStep(h, 2)
+  await preStep(h, 2)
   assert.equal(await attemptPressure(h), null, '回合 2 重新询问')
   const s3 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=2` })
   assert.equal(s3.json.repeatCount, 1, '新回合归 1')
@@ -661,7 +725,7 @@ test('state.json：未知会话 → none；GET 不改变状态（peek 语义）'
   assert.equal(none.json.phase, 'none')
   assert.equal(none.json.tier, 'temporary')
   // GET 前后状态不变：临时窗不因轮询提前武装/消费
-  preStep(h, 1)
+  await preStep(h, 1)
   const s1 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(s1.json.tier, 'temporary')
   assert.equal(s1.json.currentTurn, 1)
@@ -669,14 +733,14 @@ test('state.json：未知会话 → none；GET 不改变状态（peek 语义）'
   const s2 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(s2.json.tier, 'temporary', 'GET 幂等')
   turnEnd(h, 1)
-  preStep(h, 2)
+  await preStep(h, 2)
   const s3 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=2` })
   assert.equal(s3.json.tier, 'temporary')
   turnEnd(h, 2)
-  preStep(h, 3)
+  await preStep(h, 3)
   await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=3` })
   turnEnd(h, 3)
-  preStep(h, 4)
+  await preStep(h, 4)
   const s4 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=4` })
   assert.equal(s4.json.tier, 'manual', '过期后报告已切回手动拒绝')
 })
@@ -693,7 +757,7 @@ test('state.json：promptBar=false 上报（客户端据此不渲染提示条）
 
 test('state.json v2：现算压力快照（占用/token/窗口/压缩点/生效比例）', async () => {
   const h = mockHarness({ tier: 'off', tokens: 162000, contextWindow: 262144 })
-  preStep(h, 1) // noteAgent 记录 session（快照数据源）
+  await preStep(h, 1) // noteAgent 记录 session（快照数据源）
   const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(s.json.occupancyTokens, 162000)
   assert.equal(s.json.contextWindow, 262144)
@@ -704,7 +768,7 @@ test('state.json v2：现算压力快照（占用/token/窗口/压缩点/生效�
 
 test('F2 直读 loader 行：compaction-policy 活配置修正压缩点（用户机 0.75/0 形态）', async () => {
   const h = mockHarness({ tier: 'off', tokens: 162000, contextWindow: 262144, policyRow: { enabled: true, triggerRatio: 0.75, headroomTokens: 0 } })
-  preStep(h, 1)
+  await preStep(h, 1)
   const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   // floor(min(0.75×262144, 262144−0−0)) = 196608
   assert.equal(s.json.compactionPoint, 196608, '按策略行修正压缩点')
@@ -725,7 +789,7 @@ test('F2 直读 v0.2.8：entries() 递归（组内子行）+ fiber 活配置优�
     store: {},
     entries: function * () { yield nested },
   }
-  preStep(h, 1)
+  await preStep(h, 1)
   const s = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=1` })
   assert.equal(s.json.compactionPoint, Math.floor(W * 0.3), 'entries() 递归找到组内行（0.3 生效）')
 
@@ -804,7 +868,7 @@ test('F2 回退：未装/禁用/路由不命中/预算非正 → 内置默认 0.
 test('F1 数据链：decide 路径占用率与 state.json 快照同源（pressureSnapshot）', async () => {
   // tokens 92000/100000 = 0.92 ≥ 0.9 → temporary 切 manual（decide 用同一快照口径）
   const h = mockHarness({ tier: 'temporary', tokens: 92000, contextWindow: 100000 })
-  preStep(h, 1)
+  await preStep(h, 1)
   assert.equal(await attemptPressure(h), null)
   const switched = traceEvents(h.traceStart).find(e => e.ev === 'tier-switch')
   assert.equal(switched.occupancy, 0.92)
@@ -819,7 +883,7 @@ test('F1 数据链：decide 路径占用率与 state.json 快照同源（pressur
 
 test('quiet temporary：本回合起拦 3 回合（事件带还剩N回合），到期切回 manual 询问', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 85000, contextWindow: 100000 })
-  preStep(h, 4)
+  await preStep(h, 4)
   assert.equal(await attemptPressure(h), null, 'manual 首次询问拦截')
   const quiet = await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=temporary` })
   assert.equal(quiet.json.ok, true)
@@ -831,13 +895,13 @@ test('quiet temporary：本回合起拦 3 回合（事件带还剩N回合），�
   assert.equal(blocked.length, 1)
   assert.equal(blocked[0].expiresAtTurn, 6)
   turnEnd(h, 4)
-  preStep(h, 5)
+  await preStep(h, 5)
   assert.equal(await attemptPressure(h), null, '回合 5 继续拦')
   turnEnd(h, 5)
-  preStep(h, 6)
+  await preStep(h, 6)
   assert.equal(await attemptPressure(h), null, '回合 6 继续拦（还剩1回合）')
   turnEnd(h, 6)
-  preStep(h, 7)
+  await preStep(h, 7)
   assert.equal(await attemptPressure(h), null, '回合 7 过期 → manual 重新询问')
   const expired = traceEvents(h.traceStart).find(e => e.ev === 'tier-expired')
   assert.equal(expired.to, 'manual')
@@ -849,23 +913,23 @@ test('quiet temporary（中断回合）：以询问条回合为锚武装，跳�
   const h = mockHarness({ tier: 'manual', tokens: 85000, contextWindow: 100000 })
   // 回合 5 被中断：pre-step 走了（currentTurn=5），turn-stopping 不走
   // （dsh-agent-loop 中止路径设 turnEnds={kind:'aborted'} 后 rethrow）
-  preStep(h, 5)
+  await preStep(h, 5)
   assert.equal(await attemptPressure(h), null, '中断前的 manual 询问拦截')
   // 在死回合 5 的条上点"三回合内不再询问"（客户端带上条目回合 5）
   const quiet = await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=temporary&turn=5` })
   assert.equal(quiet.json.expiresAtTurn, 8, 'base = max(currentTurn=5, 条回合5+1=6) = 6 → 覆盖 6/7/8')
   assert.equal(quiet.json.turn, 5, '事件仍落在点击的条上（currentTurn 未推进）')
   // 回合 6/7/8 全拦（三回合语义兑现），回合 9 过期 → manual 重新询问
-  preStep(h, 6)
+  await preStep(h, 6)
   assert.equal(await attemptPressure(h), null, '回合 6 拦')
   turnEnd(h, 6)
-  preStep(h, 7)
+  await preStep(h, 7)
   assert.equal(await attemptPressure(h), null, '回合 7 拦')
   turnEnd(h, 7)
-  preStep(h, 8)
+  await preStep(h, 8)
   assert.equal(await attemptPressure(h), null, '回合 8 拦')
   turnEnd(h, 8)
-  preStep(h, 9)
+  await preStep(h, 9)
   assert.equal(await attemptPressure(h), null, '回合 9 过期 → manual 重新询问')
   const expired = traceEvents(h.traceStart).find(e => e.ev === 'tier-expired')
   assert.equal(expired.to, 'manual')
@@ -873,7 +937,7 @@ test('quiet temporary（中断回合）：以询问条回合为锚武装，跳�
 
 test('quiet forbid：本会话驳回全部自动压缩（含溢出），全局改档解除', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000 })
-  preStep(h, 2)
+  await preStep(h, 2)
   const quiet = await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=forbid` })
   assert.equal(quiet.json.ok, true)
   assert.equal(quiet.json.mode, 'forbid')
@@ -888,7 +952,7 @@ test('quiet forbid：本会话驳回全部自动压缩（含溢出），全局�
 
 test('clear-override：清会话覆盖（仪表快切配套），清后按全局档重新决策', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000 })
-  preStep(h, 2)
+  await preStep(h, 2)
   await callRoute(h, '/refuse-compaction/quiet', { method: 'POST', query: `sessionId=${h.sid}&mode=forbid` })
   assert.equal(await attemptPressure(h), null, '覆盖生效中照拦')
   const cleared = await callRoute(h, '/refuse-compaction/clear-override', { method: 'POST', query: `sessionId=${h.sid}` })
@@ -908,7 +972,7 @@ test('clear-override：清会话覆盖（仪表快切配套），清后按全局
 
 test('refuse：提示条翻"已拒绝"灰态，回合内后续静默拦，下一回合重新询问', async () => {
   const h = mockHarness({ tier: 'manual', tokens: 90000 })
-  preStep(h, 3)
+  await preStep(h, 3)
   assert.equal(await attemptPressure(h), null, '首次询问拦截')
   const refused = await callRoute(h, '/refuse-compaction/refuse', { method: 'POST', query: `sessionId=${h.sid}` })
   assert.equal(refused.json.ok, true)
@@ -920,7 +984,7 @@ test('refuse：提示条翻"已拒绝"灰态，回合内后续静默拦，下一
   const state2 = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}&turn=3` })
   assert.equal(state2.json.phase, 'refused', '拒绝态保持')
   turnEnd(h, 3)
-  preStep(h, 4)
+  await preStep(h, 4)
   assert.equal(await attemptPressure(h), null, '下一回合重新询问')
 })
 
@@ -1008,4 +1072,367 @@ test('准入：回环逐段校验，127.0.0.1.evil.example 不算回环', async 
     headers: { host: '127.0.0.1.evil.example' },
   })
   assert.equal(res.code, 403)
+})
+
+/* -------------------------------------------------------------------------- */
+/* 10. 截断自动恢复（auto-resume）                                              */
+/* -------------------------------------------------------------------------- */
+
+/** turn/end 事件：session/event 监听器的输入。 */
+function turnEndEvent(turn, kind = 'max-tokens') {
+  return { type: 'turn/end', seq: 9000 + turn, data: { turn, reason: { kind } } }
+}
+
+/** 走真实入口：ctx.on('session/event') 的监听器。 */
+async function fireTurnEnd(h, turn, kind = 'max-tokens') {
+  const listener = h.listeners['session/event']
+  assert.ok(listener, 'apply 未注册 session/event')
+  const returned = await listener(h.session, turnEndEvent(turn, kind))
+  // 真实的 agent 会把 followup 消息取走开新一轮；mock 里手动消费，模拟该时序。
+  h.agent.inbox.nextTurn.length = 0
+  return returned
+}
+
+/** 一段最小可信表面：system + turn1 + turn2（turn2 是被截断的那一轮）。 */
+function twoTurnSurface() {
+  return [
+    { seq: 1, type: 'system/message', data: {} },
+    { seq: 2, type: 'user/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'old request' }] } } },
+    { seq: 3, type: 'assistant/message', data: { turn: 1, message: { content: [{ type: 'text', text: 'old answer' }] } } },
+    { seq: 4, type: 'user/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'latest request' }] } } },
+    { seq: 5, type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'truncated answer' }] } } },
+  ]
+}
+
+test('自动恢复：max-tokens 结束 → 自动排队一条「继续」（插件自有 source）', async () => {
+  const h = mockHarness({ tier: 'off', autoResume: 'continue' })
+  await fireTurnEnd(h, 1)
+  assert.equal(h.agent.followups.length, 1, '必须自动继续一次')
+  const message = h.agent.followups[0]
+  assert.equal(message.role, 'user')
+  assert.equal(message.source.kind, 'refuse-compaction:auto-resume')
+  assert.match(message.content[0].text, /继续/)
+  const fired = traceEvents(h.traceStart).find(e => e.ev === 'resume-fire')
+  assert.equal(fired?.mode, 'continue')
+  assert.equal(fired?.attempt, 1)
+})
+
+test('自动恢复：aborted / error / completed 一律不触发', async () => {
+  const h = mockHarness({ tier: 'off', autoResume: 'continue' })
+  await fireTurnEnd(h, 1, 'aborted')
+  await fireTurnEnd(h, 2, 'error')
+  await fireTurnEnd(h, 3, 'completed')
+  assert.equal(h.agent.followups.length, 0)
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'resume-fire').length, 0)
+})
+
+test('自动恢复：off 档完全不动作（默认关闭）', async () => {
+  const h = mockHarness({ tier: 'manual' })
+  await fireTurnEnd(h, 1)
+  assert.equal(h.agent.followups.length, 0)
+})
+
+test('自动恢复：用户已排队输入 → 不抢话（resume-skip user-pending）', async () => {
+  const h = mockHarness({ tier: 'off', autoResume: 'continue' })
+  h.agent.inbox.nextTurn.push({ id: 'user-typed', source: { kind: 'user' } })
+  await fireTurnEnd(h, 1)
+  assert.equal(h.agent.followups.length, 0, '用户先说话')
+  const skip = traceEvents(h.traceStart).find(e => e.ev === 'resume-skip')
+  assert.equal(skip?.reason, 'user-pending')
+})
+
+test('自动恢复：连续上限 2 次后停手；用户新消息重置计数', async () => {
+  const h = mockHarness({ tier: 'off', autoResume: 'continue', autoResumeMax: 2 })
+  await fireTurnEnd(h, 1)
+  await fireTurnEnd(h, 2)
+  await fireTurnEnd(h, 3)
+  assert.equal(h.agent.followups.length, 2, '第三次必须停手')
+  const exhausted = traceEvents(h.traceStart).find(e => e.ev === 'resume-exhausted')
+  assert.equal(exhausted?.attempts, 2)
+  // 用户真的插话 → 计数归零，可再次恢复
+  await preStep(h, 4, [{ source: { kind: 'user' }, content: [{ type: 'text', text: '我自己来' }] }])
+  await fireTurnEnd(h, 4)
+  assert.equal(h.agent.followups.length, 3)
+})
+
+test('自动恢复 continue 档：低占用时绝不压缩（不调 compactRegion）', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    contextWindow: 100000,
+    tokens: 5000,
+    maxTokens: 32768,
+    surfaceEvents: twoTurnSurface(),
+  })
+  await fireTurnEnd(h, 2)
+  await preStep(h, 3, [h.agent.followups[0]])
+  assert.equal(h.engine.regionCalls.length, 0, '剩余输出空间充足 → 只继续')
+  const fired = traceEvents(h.traceStart).find(e => e.ev === 'resume-fire')
+  assert.equal(fired?.compress, false)
+  assert.equal(fired?.remaining, 100000 - 5000 - 32768)
+})
+
+test('自动恢复 recover 档：剩余空间不足 → 只压「被截断轮之前」，该轮原样保留', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    contextWindow: 61440,
+    tokens: 50000,
+    maxTokens: 32768,
+    maxTokens: 32768,
+    surfaceEvents: twoTurnSurface(),
+  })
+  await fireTurnEnd(h, 2)
+  assert.equal(h.agent.followups.length, 1)
+  await preStep(h, 3, [h.agent.followups[0]])
+  assert.deepEqual(h.engine.regionCalls, [{ start: 2, end: 3 }], 'start 跳过 system 头，end 停在被截断轮之前')
+  const compacted = traceEvents(h.traceStart).find(e => e.ev === 'resume-compact')
+  assert.equal(compacted?.brokenTurn, 2)
+  assert.equal(compacted?.shadowed, 2)
+})
+
+test('自动恢复：无可压范围（只有被截断的一轮）→ 跳过压缩但仍继续', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    contextWindow: 61440,
+    tokens: 50000,
+    maxTokens: 32768,
+    surfaceEvents: [
+      { seq: 1, type: 'system/message', data: {} },
+      { seq: 2, type: 'user/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'only turn' }] } } },
+      { seq: 3, type: 'assistant/message', data: { turn: 2, message: { content: [{ type: 'text', text: 'cut' }] } } },
+    ],
+  })
+  await fireTurnEnd(h, 2)
+  await preStep(h, 3, [h.agent.followups[0]])
+  assert.equal(h.engine.regionCalls.length, 0)
+  const skip = traceEvents(h.traceStart).find(e => e.ev === 'resume-compact-skip')
+  assert.equal(skip?.reason, 'no-range')
+})
+
+test('自动恢复：压缩失败只降级为「继续」，不抛不给引擎补二次压缩', async () => {
+  const engine = makeEngine({ failRegion: new Error('summary blew up') })
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    engine,
+    contextWindow: 61440,
+    tokens: 50000,
+    maxTokens: 32768,
+    surfaceEvents: twoTurnSurface(),
+  })
+  await fireTurnEnd(h, 2)
+  await preStep(h, 3, [h.agent.followups[0]])
+  const failure = traceEvents(h.traceStart).find(e => e.ev === 'resume-compact-fail')
+  assert.match(failure?.err ?? '', /summary blew up/)
+  // 失败不得设置 resume-hold：引擎本回合仍可自行压缩
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'resume-hold').length, 0)
+})
+
+test('自动恢复：压缩成功 → 本回合引擎不再二次压缩（resume-hold）', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    contextWindow: 61440,
+    tokens: 50000,
+    maxTokens: 32768,
+    surfaceEvents: twoTurnSurface(),
+  })
+  await fireTurnEnd(h, 2)
+  await preStep(h, 3, [h.agent.followups[0]])
+  assert.deepEqual(await attemptPressure(h), null, '恢复压缩刚落地 → 压力路径直接 no-op')
+  assert.equal(h.engine.pressureCalls.length, 0)
+  assert.ok(traceEvents(h.traceStart).some(e => e.ev === 'resume-hold'))
+})
+
+test('自动恢复摘要：包装 summarize 时带上只读尾部 + 独立输出上限', async () => {
+  const captured = []
+  async function* fakeStream(options) {
+    captured.push(options)
+    yield { type: 'block-end', index: 0, block: { type: 'text', text: '## Next Step\n- keep going' } }
+    yield { type: 'usage', usage: { inputTokens: 10, outputTokens: 5, totalTokens: 15 } }
+    yield { type: 'finish', reason: { kind: 'completed' } }
+  }
+  const h = mockHarness({
+    tier: 'off',
+    autoResume: 'recover',
+    contextWindow: 61440,
+    tokens: 50000,
+    maxTokens: 32768,
+    surfaceEvents: twoTurnSurface(),
+    llmStream: fakeStream,
+  })
+  await fireTurnEnd(h, 2)
+  await preStep(h, 3, [h.agent.followups[0]])
+  assert.equal(captured.length, 1, '一次旁路摘要请求')
+  const options = captured[0]
+  assert.equal(options.purpose, 'compaction')
+  assert.equal(options.maxTokens, 4096, '摘要请求绝不能沿用会话 32k 的输出预留')
+  const last = options.messages[options.messages.length - 2]
+  const tailText = JSON.stringify(last)
+  assert.match(tailText, /MOST RECENT TURN/, '指令前必须带只读尾部前言')
+  assert.match(tailText, /truncated answer/, '尾部必须含被截断轮的可见内容')
+  assert.doesNotMatch(tailText, /reasoning/, '绝不把 reasoning 塞进摘要请求')
+})
+
+/* -------------------------------------------------------------------------- */
+/* 11. 输出预算守门（output guard / A）                                         */
+/* -------------------------------------------------------------------------- */
+
+/** 走真实入口：ctx.on('agent/request') 的 waterfall 监听器。 */
+async function fireRequest(h, proposed = { provider: 'test-provider', model: 'test-model', maxTokens: 32768 }) {
+  const listener = h.listeners['agent/request']
+  assert.ok(listener, 'apply 未注册 agent/request')
+  return listener({ agent: h.agent, turn: 1, step: 1, signal: new AbortController().signal }, async () => proposed)
+}
+
+/** 压缩点压到 20,000（triggerRatio 0.2）：便于在 100k 窗口里造出「越过压缩点」。 */
+const GUARD_POLICY = { enabled: true, triggerRatio: 0.2, headroomTokens: 0 }
+
+test('输出守门：未越过压缩点 → 原样返回（正常回合绝不碰 maxTokens）', async () => {
+  const h = mockHarness({
+    tier: 'manual',
+    contextWindow: 100000,
+    tokens: 5000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 32768)
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'output-guard').length, 0)
+})
+
+test('输出守门：越过压缩点且预算不足 → 压到「窗口 − 已用 − 4096」', async () => {
+  const h = mockHarness({
+    tier: 'forbid',
+    contextWindow: 100000,
+    tokens: 70000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 100000 - 70000 - 4096)
+  const guard = traceEvents(h.traceStart).find(e => e.ev === 'output-guard')
+  assert.equal(guard?.configured, 32768)
+  assert.equal(guard?.clamped, 25904)
+  assert.equal(guard?.compactionPoint, 20000)
+  // 其余字段原样保留（provider/model 不得改动）
+  assert.equal(out.provider, 'test-provider')
+  assert.equal(out.model, 'test-model')
+})
+
+test('输出守门：预算已够（剩余空间大于配置上限）→ 不压', async () => {
+  const h = mockHarness({
+    tier: 'manual',
+    contextWindow: 100000,
+    tokens: 25000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 32768, '25,000 已过压缩点，但 100k−25k−4096 > 32768')
+})
+
+test('输出守门：压到 1024 以下就没有意义 → 跳过，交给溢出恢复', async () => {
+  const h = mockHarness({
+    tier: 'forbid',
+    contextWindow: 100000,
+    tokens: 99000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 32768, '不压，保持原值')
+  const skip = traceEvents(h.traceStart).find(e => e.ev === 'output-guard-skip')
+  assert.equal(skip?.budget, -3096)
+})
+
+test('输出守门：off 档完全不动作', async () => {
+  const h = mockHarness({
+    tier: 'forbid',
+    contextWindow: 100000,
+    tokens: 70000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+    outputGuard: 'off',
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 32768)
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'output-guard').length, 0)
+})
+
+test('输出守门：maxTokens 缺失 → 不动（不凭空造一个上限）', async () => {
+  const h = mockHarness({
+    tier: 'forbid',
+    contextWindow: 100000,
+    tokens: 70000,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h, { provider: 'test-provider', model: 'test-model' })
+  assert.equal(out.maxTokens, undefined)
+})
+
+test('输出守门：state.json 现算 armed / effective（仪表提醒的数据源）', async () => {
+  const h = mockHarness({
+    tier: 'forbid',
+    contextWindow: 100000,
+    tokens: 70000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const res = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(res.code, 200)
+  const guard = res.json.outputGuard
+  assert.equal(guard.enabled, true)
+  assert.equal(guard.armed, true)
+  assert.equal(guard.configured, 32768)
+  assert.equal(guard.effective, 25904)
+  assert.equal(guard.remaining, 30000)
+  assert.equal(guard.safety, 4096)
+})
+
+test('输出守门：未越线时 state.json 的 armed=false（仪表不提醒）', async () => {
+  const h = mockHarness({
+    tier: 'manual',
+    contextWindow: 100000,
+    tokens: 5000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const res = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(res.json.outputGuard.armed, false)
+  assert.equal(res.json.outputGuard.effective, 32768)
+})
+
+test('输出守门：档位「关闭」时整条停用（即使开关打开、已越线）', async () => {
+  const h = mockHarness({
+    tier: 'off',
+    contextWindow: 100000,
+    tokens: 70000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 32768, '关闭档 = 完全放手，不碰输出预算')
+  assert.equal(traceEvents(h.traceStart).filter(e => e.ev === 'output-guard').length, 0)
+  const res = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(res.json.outputGuard.enabled, true, '开关本身是开的')
+  assert.equal(res.json.outputGuard.armed, false, '但档位关闭 → 不生效')
+  assert.equal(res.json.outputGuard.tier, 'off')
+})
+
+test('输出守门：临时档同样生效（不是只有禁止档）', async () => {
+  const h = mockHarness({
+    tier: 'temporary',
+    contextWindow: 100000,
+    tokens: 70000,
+    maxTokens: 32768,
+    policyRow: GUARD_POLICY,
+  })
+  const out = await fireRequest(h)
+  assert.equal(out.maxTokens, 25904)
+  const res = await callRoute(h, '/refuse-compaction/state.json', { query: `sessionId=${h.sid}` })
+  assert.equal(res.json.outputGuard.armed, true)
+  assert.equal(res.json.outputGuard.tier, 'temporary')
 })
